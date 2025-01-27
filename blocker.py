@@ -137,18 +137,15 @@ def parse_time(time_str):
 
 def main():
     parser = argparse.ArgumentParser(description='Block websites for a specified duration.')
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('-w', '--websites', nargs='+', 
-                      help='Websites to block (e.g., facebook.com twitter.com)')
-    group.add_argument('-f', '--file', type=str,
+    parser.add_argument('-f', '--file', type=str, default='distractions.txt',
                       help='Path to text file containing websites to block (one per line)')
-    parser.add_argument('-t', '--time', type=str, default='30m',
-                        help='Duration to block (e.g., 30m, 2h, 1d). Default: 30m')
+    parser.add_argument('-t', '--time', type=str, default='30s',
+                        help='Duration to block (e.g., 10s, 45m, 2h, 1d). Default: 30s')
     
     args = parser.parse_args()
     
     # Get websites either from command line or file
-    websites = args.websites if args.websites else read_websites_from_file(args.file)
+    websites = read_websites_from_file(args.file)
     duration_minutes = parse_time(args.time)
     
     block_websites(websites, duration_minutes)
