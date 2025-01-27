@@ -1,6 +1,6 @@
 # Deepwork with Deepseek
 
-Block distraction sites for a specific duration. 
+Block distractive sites for a specific duration. 
 
 
 Change permission to run as root
