@@ -3,13 +3,13 @@
 Block distractive sites for a specific duration. 
 
 
-Change permission to run as root
+Change permissions to make the script executable 
 
 ```
 chmod +x blocker.py
 ```
 
-Choose to block with various different time units. 
+Choose to block with various different time units
 
 ```
 sudo python blocker.py -f distractions.txt -t 30s  # 30 seconds
