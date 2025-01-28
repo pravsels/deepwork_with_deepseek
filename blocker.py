@@ -1,22 +1,24 @@
-#!/usr/bin/env python3
+# Improved version with additional features and better error handling
 import sys
-import time
 import argparse
+import logging
 from datetime import datetime, timedelta
 import subprocess
 import platform
+from pathlib import Path
+import asyncio
+import signal
+from typing import Set, List
+import re
 
-# The hosts file location varies by OS
-HOSTS_PATH = "/etc/hosts" if platform.system() != "Windows" else r"C:\Windows\System32\drivers\etc\hosts"
-LOCALHOST = "127.0.0.1"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def get_admin_command():
-    """Return the appropriate admin command based on the OS."""
-    if platform.system() == "Windows":
-        return "runas /user:Administrator "
-    return "sudo "
-
-def check_admin():
+def check_admin() -> bool:
     """Check if the script has administrative privileges."""
     try:
         if platform.system() == "Windows":
@@ -25,132 +27,171 @@ def check_admin():
     except:
         return False
 
-def flush_dns_cache():
-    """Flush DNS cache to ensure changes take effect immediately."""
-    try:
-        # Try systemd-resolved first (most common on modern Linux systems)
-        subprocess.run(["sudo", "systemctl", "restart", "systemd-resolved"], 
-                      check=True, 
-                      stdout=subprocess.PIPE, 
-                      stderr=subprocess.PIPE)
-        print("DNS cache flushed successfully")
-    except subprocess.CalledProcessError:
-        print("Could not flush DNS cache. You may need to restart your browser for changes to take effect.")
-        
-def block_websites(websites, duration_minutes):
-    """Block specified websites for a given duration."""
-    if not check_admin():
-        print(f"Please run this script with administrative privileges:")
-        print(f"{get_admin_command()}{sys.executable} {sys.argv[0]} {' '.join(sys.argv[1:])}")
-        sys.exit(1)
+def get_admin_command() -> str:
+    """Return the appropriate admin command based on the OS."""
+    if platform.system() == "Windows":
+        return "runas /user:Administrator "
+    return "sudo "
 
-    end_time = datetime.now() + timedelta(minutes=duration_minutes)
-    
-    # Add www. variant for each website
-    all_sites = set()
-    for site in websites:
-        all_sites.add(site)
-        if not site.startswith('www.'):
-            all_sites.add('www.' + site)
+class WebsiteBlocker:
+    def __init__(self):
+        self.HOSTS_PATH = Path("/etc/hosts" if platform.system() != "Windows" else r"C:\Windows\System32\drivers\etc\hosts")
+        self.LOCALHOST = "127.0.0.1"
+        self.BLOCK_MARKER = "# Website blocks added by blocker script"
+        self._validate_hosts_path()
 
-    try:
-        # Read existing hosts file
-        with open(HOSTS_PATH, 'r') as file:
-            hosts_content = file.readlines()
+    def _validate_hosts_path(self) -> None:
+        """Validate that the hosts file exists and is accessible."""
+        if not self.HOSTS_PATH.exists():
+            raise FileNotFoundError(f"Hosts file not found at {self.HOSTS_PATH}")
+        if not self.HOSTS_PATH.is_file():
+            raise ValueError(f"Hosts path {self.HOSTS_PATH} is not a regular file")
 
-        # Filter out any existing blocked sites
-        hosts_content = [line for line in hosts_content if not any(site in line for site in all_sites)]
+    @staticmethod
+    def is_valid_domain(domain: str) -> bool:
+        """Validate domain name format."""
+        pattern = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        return bool(re.match(pattern, domain))
 
-        # Add new blocks
-        with open(HOSTS_PATH, 'w') as file:
-            file.writelines(hosts_content)
-            file.write("\n# Website blocks added by blocker script\n")
-            for site in all_sites:
-                file.write(f"{LOCALHOST} {site}\n")
+    def expand_domains(self, domains: Set[str]) -> Set[str]:
+        """Add www. variant for each domain if not present."""
+        expanded = set()
+        for domain in domains:
+            if not self.is_valid_domain(domain):
+                logger.warning(f"Skipping invalid domain: {domain}")
+                continue
+            expanded.add(domain)
+            if not domain.startswith('www.'):
+                expanded.add('www.' + domain)
+        return expanded
 
-        # Flush DNS cache after modifying hosts file
-        flush_dns_cache()
+    async def flush_dns_cache(self) -> None:
+        """Flush DNS cache asynchronously with better error handling."""
+        try:
+            if platform.system() == "Windows":
+                await asyncio.create_subprocess_shell("ipconfig /flushdns")
+            elif platform.system() == "Darwin":  # macOS
+                await asyncio.create_subprocess_shell("dscacheutil -flushcache")
+                await asyncio.create_subprocess_shell("killall -HUP mDNSResponder")
+            else:  # Linux
+                try:
+                    await asyncio.create_subprocess_shell("sudo systemctl restart systemd-resolved")
+                except:
+                    await asyncio.create_subprocess_shell("sudo service network-manager restart")
+            
+            logger.info("DNS cache flushed successfully")
+        except Exception as e:
+            logger.warning(f"Could not flush DNS cache: {e}")
+            logger.info("You may need to restart your browser for changes to take effect")
 
-        print(f"Websites blocked until {end_time.strftime('%H:%M:%S')}")
+    async def modify_hosts_file(self, domains: Set[str], add_blocks: bool = True) -> None:
+        """Modify hosts file to add or remove domain blocks."""
+        try:
+            hosts_content = self.HOSTS_PATH.read_text().splitlines()
+            
+            # Remove existing blocks
+            hosts_content = [line for line in hosts_content 
+                           if not any(domain in line for domain in domains) 
+                           and self.BLOCK_MARKER not in line]
+
+            if add_blocks:
+                hosts_content.append(self.BLOCK_MARKER)
+                for domain in domains:
+                    hosts_content.append(f"{self.LOCALHOST} {domain}")
+
+            self.HOSTS_PATH.write_text('\n'.join(hosts_content) + '\n')
+            await self.flush_dns_cache()
+            
+        except Exception as e:
+            logger.error(f"Error modifying hosts file: {e}")
+            raise
+
+    async def block_websites(self, websites: List[str], duration: float) -> None:
+        """Block specified websites for a given duration."""
+        if not check_admin():
+            raise PermissionError("Administrative privileges required")
+
+        domains = self.expand_domains(set(websites))
+        end_time = datetime.now() + timedelta(minutes=duration)
         
         try:
-            # Wait for the specified duration
-            time.sleep(duration_minutes * 60)
-        except KeyboardInterrupt:
-            print("\nBlocking interrupted by user.")
-        finally:
-            # Remove the blocks
-            with open(HOSTS_PATH, 'r') as file:
-                hosts_content = file.readlines()
-            
-            # Remove our blocks
-            hosts_content = [line for line in hosts_content 
-                           if not any(site in line for site in all_sites) and 
-                           "Website blocks added by blocker script" not in line]
-            
-            with open(HOSTS_PATH, 'w') as file:
-                file.writelines(hosts_content)
-            
-            # Flush DNS cache after unblocking
-            flush_dns_cache()
-            print("\nWebsites unblocked.")
+            # Set up signal handlers
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.cleanup(domains, s)))
 
-    except PermissionError:
-        print("Error: Permission denied. Please run with administrative privileges.")
-        sys.exit(1)
+            logger.info(f"Blocking {len(domains)} domains until {end_time.strftime('%H:%M:%S')}")
+            await self.modify_hosts_file(domains, add_blocks=True)
+            
+            try:
+                await asyncio.sleep(duration * 60)
+            except asyncio.CancelledError:
+                logger.info("Blocking interrupted by user")
+            
+            await self.cleanup(domains)
 
-def read_websites_from_file(file_path):
-    """Read websites from a text file, one website per line."""
-    try:
-        with open(file_path, 'r') as file:
-            # Read lines and remove whitespace, empty lines, and comments
-            websites = [line.strip() for line in file 
-                       if line.strip() and not line.startswith('#')]
-        return websites
-    except FileNotFoundError:
-        print(f"Error: File '{file_path}' not found.")
-        sys.exit(1)
+        except Exception as e:
+            logger.error(f"Error during website blocking: {e}")
+            await self.cleanup(domains)
+            raise
 
-def parse_time(time_str):
-    """Parse time string with units (e.g., '30s', '30m', '2h', '1d')."""
+    async def cleanup(self, domains: Set[str], sig = None) -> None:
+        """Clean up blocks and handle program termination."""
+        if sig:
+            logger.info(f"Received signal {sig.name}, cleaning up...")
+        
+        await self.modify_hosts_file(domains, add_blocks=False)
+        logger.info("Websites unblocked")
+
+def parse_duration(time_str: str) -> float:
+    """Parse time string with improved validation and error handling."""
     units = {
-        's': 1/60,       # seconds
-        'm': 1,          # minutes
-        'h': 60,         # hours
-        'd': 60 * 24,    # days
+        's': 1/60,
+        'm': 1,
+        'h': 60,
+        'd': 1440
     }
     
-    if str(time_str).isdigit():  # If just a number, assume minutes
-        return int(time_str)
-        
-    unit = time_str[-1].lower()
-    if unit not in units:
-        print(f"Invalid time unit. Please use 's' (seconds), 'm' (minutes), 'h' (hours), or 'd' (days)")
-        sys.exit(1)
-        
-    try:
-        number = int(time_str[:-1])
-        return number * units[unit]
-    except ValueError:
-        print(f"Invalid time format. Example formats: 45s, 30m, 2h, 1d")
-        sys.exit(1)
+    match = re.match(r'^(\d+)([smhd])?$', time_str.lower())
+    if not match:
+        raise ValueError(
+            "Invalid time format. Use: \n"
+            "- Plain number (e.g., '30') for minutes\n"
+            "- Time with units: '45s', '30m', '2h', '1d'"
+        )
+    
+    number, unit = match.groups()
+    return int(number) * units.get(unit, 1)  # Default to minutes if no unit specified
 
-def main():
-    parser = argparse.ArgumentParser(description='Block websites for a specified duration.')
-    parser.add_argument('-f', '--file', type=str, default='distractions.txt',
+async def main():
+    parser = argparse.ArgumentParser(
+        description='Block distracting websites for a specified duration.',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-f', '--file', type=Path, default='distractions.txt',
                       help='Path to text file containing websites to block (one per line)')
     parser.add_argument('-t', '--time', type=str, default='30s',
                         help='Duration to block (e.g., 10s, 45m, 2h, 1d). Default: 30s')
-    
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose logging')
+
     args = parser.parse_args()
     
-    # Get websites either from command line or file
-    websites = read_websites_from_file(args.file)
-    duration_minutes = parse_time(args.time)
-    
-    block_websites(websites, duration_minutes)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        websites = [line.strip() for line in args.file.read_text().splitlines() 
+                   if line.strip() and not line.startswith('#')]
+        duration = parse_duration(args.time)
+        
+        blocker = WebsiteBlocker()
+        await blocker.block_websites(websites, duration)
+        
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
-    
