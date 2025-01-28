@@ -1,4 +1,4 @@
-name: blocker
+name: dwd
 channels:
   - conda-forge
   - defaults
