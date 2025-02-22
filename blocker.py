@@ -1,4 +1,4 @@
-# Improved version with additional features and better error handling
+
 import sys
 import argparse
 import logging

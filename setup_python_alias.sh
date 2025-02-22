@@ -1,4 +1,3 @@
 #!/bin/bash
-alias python='sudo $(which python)'
 
-
+alias python='sudo $(which python3)'
